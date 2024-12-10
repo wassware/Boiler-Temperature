@@ -1,9 +1,9 @@
 // Boiler temperature controller.
 // Improvement for an old cast iron boiler by adding temperature control and shutdown management.
-// Setpoint temperature can be overriden by boiler control with restore to default timeout
+// Setpoint temperature can be overriden by Boiler Control with restore to default timeout
 // Sits on standard framework
-// Has one DS temp sensor for boiler exit temperature
-// Uses PCF8574 I2C for 8 bit 5v io
+// Has 2 DS temp sensors for boiler exit and inlet temperature
+// Uses PCF8574 I2C for 8 bit 5v io to relays and mains volt sensors
 //
 // The system has 
 //  2 conventional single port valves
@@ -11,7 +11,7 @@
 //  Tado with on/off relay for CH valve
 //  Gas boiler with mechanical thermostat
 //
-// 240 v input board listens to 
+// 240 v sensor board listens to 
 //   cylinder stat volts
 //   and tado relay volts
 //   main gas valve (meaning flame on) for info and fault detect
@@ -25,12 +25,17 @@
 // to mitigate over / undershoot
 // Tighter temperature hysteresis - around 5C - with anti-cycle
 // Shutdown to dump boiler heat to system before pump stop
+// On hw demand only has a HWOnly setpoint.
 //
 // Temerature load and weather compensation is performed by the Boiler Control.
 // build in sim for testing
 
-const char* module = "boiler-temp";
+const char* module = "boiler-temp 2.2";
 const char* buildDate = __DATE__  "  "  __TIME__;
+
+//2.0 first release
+//2.1 added duty cycle - tidy mqtt panel dns efficiency
+//2.2 add: reinit, hwonly temp, code tidy, settable ds res, add 2nd ds, ds assign on userdata, ds init tests 
 
 // ----------- start properties include 1 --------------------
 #include <SPIFFS.h>
@@ -102,6 +107,10 @@ int unitId  = 9;                  // uniquness of mqtt id
 String unitIdN = "unitId";
 int wdTimeout = 30;
 String wdTimeoutN = "wdTimeout";
+int ledExtend = 0;
+String ledExtendN = "ledExtend";
+int ledInterval = 1000;
+String ledIntervalN = "ledInterval";
 // generic way of setting property as 2 property setting operations
 String propNameA = "";
 String propNameN = "propName";
@@ -114,6 +123,8 @@ String writePropsN = "writeProps";
 // ------- custom properties -----------
 int dSetTemp = 60;       // default target off temp
 String dSetTempN = "dSetTemp";
+int hwOnlyTemp = 60;       // default target off temp
+String hwOnlyTempN = "hwOnlyTemp";
 int hystTemp = 5;       //  set-x = target on temp
 String hystTempN = "hystTemp";
 int idleTemp = 35;      // cool to temp in shotdown
@@ -126,8 +137,16 @@ bool simMode = false;
 String simModeN = "simMode";
 bool graphMode = false;
 String graphModeN = "graphMode";
-int controllerTimeout = 60;       // when resets defaults
+int controllerTimeout = 120;       // when resets defaults
 String controllerTimeoutN = "contTimeout";
+int outTempUd = 0;       
+String outTempUdN = "outTempUd";
+int inTempUd = 0;       
+String inTempUdN = "inTempUd";
+int predHist = 4;       
+String predHistN = "predHist";
+int dsResolution = 10;       
+String dsResolutionN = "dsResolution";
 
 
 // ------- end custom properties -----------
@@ -479,6 +498,8 @@ void extractProps(JsonDocument &doc, bool reportMissing)
   propName = mqttIdN;   if (checkProp(doc, propName, reportMissing)) mqttId = doc[propName].as<String>();
   propName = unitIdN;   if (checkProp(doc, propName, reportMissing)) unitId = doc[propName].as<int>();
   propName = wdTimeoutN;if (checkProp(doc, propName, reportMissing)) wdTimeout = max(doc[propName].as<int>(),30);
+  propName = ledIntervalN;   if (checkProp(doc, propName, reportMissing)) ledInterval = doc[propName].as<int>();
+  propName = ledExtendN;   if (checkProp(doc, propName, reportMissing)) ledExtend = doc[propName].as<int>();
   // these just for adjustment
   propName = restartN; if (checkProp(doc, propName, false)) ESP.restart();
   propName = writePropsN; if (checkProp(doc, propName, false)) writeProps(false);
@@ -486,8 +507,8 @@ void extractProps(JsonDocument &doc, bool reportMissing)
   propName = propValueN;if (checkProp(doc, propName, false)) propValue = doc[propName].as<String>();  // picked up in checkState()
 
   // ----- start custom extract -----
-
   propName = dSetTempN;if (checkProp(doc, propName, reportMissing)) dSetTemp = doc[propName].as<int>();
+  propName = hwOnlyTempN;if (checkProp(doc, propName, reportMissing)) hwOnlyTemp = doc[propName].as<int>();
   propName = hystTempN;if (checkProp(doc, propName, reportMissing)) hystTemp = doc[propName].as<int>();
   propName = idleTempN;if (checkProp(doc, propName, reportMissing)) idleTemp = doc[propName].as<int>();
   propName = tempRateN;if (checkProp(doc, propName, reportMissing)) tempRate = doc[propName].as<double>();
@@ -495,8 +516,12 @@ void extractProps(JsonDocument &doc, bool reportMissing)
   propName = simModeN;if (checkProp(doc, propName, reportMissing)) simMode = doc[propName].as<int>();
   propName = graphModeN;if (checkProp(doc, propName, reportMissing)) graphMode = doc[propName].as<int>();
   propName = controllerTimeoutN;if (checkProp(doc, propName, reportMissing)) controllerTimeout = doc[propName].as<int>();
+  propName = outTempUdN;if (checkProp(doc, propName, reportMissing)) outTempUd = doc[propName].as<int>();
+  propName = inTempUdN;if (checkProp(doc, propName, reportMissing)) inTempUd = doc[propName].as<int>();
+  propName = predHistN;if (checkProp(doc, propName, reportMissing)) predHist = doc[propName].as<int>();
+  propName = dsResolutionN;if (checkProp(doc, propName, reportMissing)) dsResolution = doc[propName].as<int>();
 
-  // ----- end custom extract -----
+  // ----- end custom extract -----dsResolution
 }
 
 // adds props for props write - customize
@@ -513,9 +538,12 @@ void addProps(JsonDocument &doc)
   doc[mqttIdN] = mqttId;
   doc[unitIdN] = unitId;
   doc[wdTimeoutN] = wdTimeout;
+  doc[ledIntervalN] = ledInterval;
+  doc[ledExtendN] = ledExtend;
 
   // ----- start custom add -----
   doc[dSetTempN] = dSetTemp;
+  doc[hwOnlyTempN] = hwOnlyTemp;
   doc[hystTempN] = hystTemp;
   doc[idleTempN] = idleTemp;
   doc[tempRateN] = tempRate;
@@ -523,6 +551,10 @@ void addProps(JsonDocument &doc)
   doc[simModeN] = simMode;
   doc[graphModeN] = graphMode;
   doc[controllerTimeoutN] = controllerTimeout;
+  doc[outTempUdN] = outTempUd;
+  doc[inTempUdN] = inTempUd;
+  doc[predHistN] = predHist;
+  doc[dsResolutionN] = dsResolution;
   // ----- end custom add -----
 }
 
@@ -540,6 +572,7 @@ void processCommandLine(String cmdLine)
     case '?':
       log(0, "v:version, w:writeprops, d:dispprops, l:loadprops p<prop>=<val>: change prop, r:restart");
       log(0, "s:showstats, z:zerostats, n:dns, 0,1,2:loglevel = " + String(logLevel));
+      log(0, "i: reinit");
       return;
     case 'w':
       writeProps(false);
@@ -590,7 +623,9 @@ void processCommandLine(String cmdLine)
       return;
 
   // ----- start custom cmd -----
-
+    case 'i':
+      tempSetup();
+      return;
   // ----- end custom cmd -----
     default:
       log(0, "????");
@@ -704,18 +739,19 @@ struct dnsIsh
   bool used = false;
   String name;
   String ip;
-  int timeout;
+  int lastSeen;
 };
 dnsIsh dnsList[DNSSIZE];
 unsigned long dnsVersion = 0;
 unsigned long lastSynchTime = 0;
+int dnsIx;
 
 void logDns()
 {
   log(0, "dns v=" + String(dnsVersion));
   for (int ix = 0; ix < DNSSIZE; ix++)
   {
-    if (dnsList[ix].used && dnsList[ix].timeout > 0)
+    if (dnsList[ix].used && dnsList[ix].lastSeen > 0)
     {
       log(0, String(ix) + " " + dnsList[ix].name + " " + dnsList[ix].ip);
     }
@@ -755,6 +791,7 @@ void sendSynch()
   JsonDocument doc;
   doc["r"] = mqttMoniker + "/c/s";    // reply token
   doc["n"] = mqttId + String(unitId);
+  doc["x"] = dnsIx;
   doc["i"] = localIp.toString();
   doc["e"] = rtc.getEpoch();
   doc["v"] = dnsVersion;
@@ -788,6 +825,7 @@ void processSynch(JsonDocument &doc)
       log(2, "espTimeAdjust: " + String(timeAdjust));
     }
   }
+  dnsIx = doc["x"].as<int>();
   long newDnsVersion = doc["v"].as<long>();
   if (newDnsVersion != 0)
   {
@@ -804,7 +842,7 @@ void processSynch(JsonDocument &doc)
         dnsList[ix].name = doc["n" + String(ix)].as<String>();
         dnsList[ix].ip = doc["i" + String(ix)].as<String>();
         dnsList[ix].used = true;
-        dnsList[ix].timeout = 1;   // for consistency with dnsLog
+        dnsList[ix].lastSeen = 1;   // for consistency with dnsLog
         log(2, ".. " + dnsList[ix].name + " " + dnsList[ix].ip);
       }
       else
@@ -1091,6 +1129,10 @@ void handleIncoming(String topic, JsonDocument &doc)
   {
     controllerOverrides(doc);
   }
+  if (topic.endsWith("/u"))
+  {
+    triggerUpdate();
+  }
   
   // end custom additional incoming
 }
@@ -1127,13 +1169,17 @@ String tempStateS(int state)
     default: return "??";
   }
 }
-
+unsigned long lastTempMs ;        // loop millisecond timer
+unsigned long tempRequestTime;    // time of request
 int tempRequestWaitMs = 800;      // conversion time 12 bit
 int valveOffDelay = 3;            // allow valve time to switch off
-unsigned long requestTempMs;      // when conversion requested
 bool tempRequested;               // in conversion wait
 unsigned long lastOnTime;
 unsigned long lastOffTime;
+unsigned long flameOnTime;
+bool lastFlameOn;
+int dutyCycle;
+unsigned long flameOffTime;
 unsigned long boilerStatOffHoldStart;  
 bool boilerStatOffHold;
 bool pcfTestOk;   //!! to Do
@@ -1145,30 +1191,66 @@ bool chDemand;
 bool flameOn;
 // from Boiler Contorl/ tado via mqtt
 bool tadoAway;
-int setTemp = 60;
+int chSetTemp = dSetTemp;   // either default or tade
+int setTemp = dSetTemp;  // and can override to hwTempOnly 
+bool tadoChDemand = false;
 // outputs
 bool hwValveOn;        
 bool chValveOn;
 bool hwOff;
 bool boilerStatOff;
 // temp management
-double actTemp = 50;
-double prevTemp = 50;
-double adjTemp = 50;
-double ovrShoot = 0;
-double undShoot = 0;
-double tmpShoot = 0;
+double actTemp;
+double inTemp;
+#define PREVTEMPSIZE 32
+double prevTemps[PREVTEMPSIZE];
+int prevTempPtr;
+double adjTemp;
+double ovrShoot;
+double undShoot;
+double tmpShoot;
 double shootHi = false;
 double shootLo = false;
 
-int controllerCountdown = 60;       // to time out signal from controller
+int outTempIx;  // order of ds discovery to get DeviceAddress
+int inTempIx;
+
+unsigned long controllerLastSeen;       // to time out signal from controller
+bool controllerActive = false;
+
 int tempState = IDLE;
+// ds management
+#define MAXDS 3
+DeviceAddress dsAddrArr[MAXDS];  // indexed by discovery order
+int dsUdataArr[MAXDS];
 int dsCount;
 
 // sim specific
 double simArr[10];
 double simTemp = 60;
 int simArrSize = 10;
+double simRate = 0.2;
+
+// mtt data economiser
+bool update;
+int mTempState;
+bool mHwDemand;
+bool mChDemand;
+bool mTadoDemand;
+bool mHwValveOn;
+bool mChValveOn;
+bool mBoilerStatOff;
+bool mFlameOn;
+bool mHwOff;
+int mSetTemp;
+double mOvrShoot;
+double mUndShoot;
+int mDutyCycle;
+
+void triggerUpdate()
+{
+  update = true;
+}
 
 void simInit()
 {
@@ -1184,12 +1266,12 @@ double doSim()
   switch (tempState)
   {
     case HEATING:
-      simTemp += 0.2;
+      simTemp += simRate;
       break;
     default:
       if (simTemp > idleTemp - 3)
       {
-        simTemp -= 0.2;
+        simTemp -= (0.6-simRate);
       }
       break;
   }
@@ -1203,7 +1285,8 @@ double doSim()
 
 void restoreDefaults()
 {
-  setTemp = dSetTemp;
+  chSetTemp = dSetTemp;
+  tadoChDemand = false;
   tadoAway = false;
 }
 
@@ -1246,7 +1329,7 @@ bool pcfSet8(byte pa, bool ba, byte pb, bool bb, byte pc, bool bc, byte pd, bool
   {
     return true;
   }
-  log(2, "Set PCF: " + bitsS(pcf8Set, 4));
+  loga(2, "Set PCF: " + bitsS(pcf8Set, 4));
   PCF_01.write8(pcf8Set);
   pcf8Get = PCF_01.read8();     // confirm
   if ((pcf8Set & 0x0F) == (pcf8Get & 0x0F))
@@ -1261,6 +1344,8 @@ bool pcfSet8(byte pa, bool ba, byte pb, bool bb, byte pc, bool bc, byte pd, bool
 // tests PFC responds on lower 4 bits used for relays
 bool pcfTest()
 {
+  int tLogLevel = logLevel;
+  logLevel = 2;
   int failCount = 0;
   for (int ix = 0; ix < 4; ix++)
   {
@@ -1274,6 +1359,7 @@ bool pcfTest()
       delay(100);
     }
   }
+  logLevel = tLogLevel;
   return (failCount == 0);
 }
 
@@ -1290,6 +1376,52 @@ void tempSetup()
   sensors.begin();
   dsCount = sensors.getDeviceCount();
   log(0, "ds sensors = " + String(dsCount));
+  sensors.setWaitForConversion(true);
+  log(0, "setresolution = " + String(dsResolution));
+  sensors.setResolution(dsResolution);
+  // test conversion time:
+  loga(0, "ds test convert/get:");
+  int maxTime = 0;
+  for (int ix = 0; ix < 5; ix++)
+  {
+    unsigned long st = millis();
+    sensors.requestTemperatures();
+    int et = millis() - st;
+    maxTime = max(maxTime, et);
+    loga(0, " " + String(et));
+    st = millis();
+    for (int is = 0; is < dsCount; is++)
+    {
+      sensors.getTempCByIndex(is);
+    }
+    et = millis() - st;
+    loga(0, "/" + String(et));
+  }
+  log(0);
+  tempRequestWaitMs = maxTime + 50;
+  log(0, "setting tempRequestWaitMs = " + String(tempRequestWaitMs));
+  sensors.setWaitForConversion(false);
+  log(0, "ds addr and user data:");
+  for (int ix = 0; ix < dsCount && ix < MAXDS; ix++)
+  {
+    sensors.getAddress(dsAddrArr[ix], ix);
+    int uData = sensors.getUserData(dsAddrArr[ix]);
+    loga(0, String(ix) + " " + String(uData));
+    if (outTempUd == uData) 
+    {
+      outTempIx = ix;
+      log(0, " assigned outTemp");
+    }
+    else if (inTempUd == uData)
+    {
+      inTempIx = ix;
+      log(0, " assigned inTemp");
+    }
+    else
+    {
+      log(0, " not assigned!!");
+    }
+  }
   
   // PFC control interface
   ScanI2C();
@@ -1302,256 +1434,441 @@ void controllerOverrides(JsonDocument doc)
 {
   if (doc.containsKey("st"))
   {
-    setTemp = doc["st"].as<int>();
+    chSetTemp = doc["st"].as<int>();
   }
   if (doc.containsKey("aw"))
   {
     tadoAway = doc["aw"].as<int>();
   }
-  controllerCountdown = controllerTimeout;
+  if (doc.containsKey("th"))
+  {
+    tadoChDemand = doc["th"].as<int>();
+  }
+  controllerLastSeen = seconds;
+  {
+    if (!controllerActive)
+    {
+      log(0, "controller active)");
+      controllerActive = true;
+    }
+  }
 }
 
-
-unsigned long lastTempMs = 0;
 void tempLoop()
 {
   unsigned long millisNow = millis();
-  if (millisNow - lastTempMs >= 1000)
+  if (!tempRequested)
   {
-    sensors.requestTemperatures(); 
-    lastTempMs = millisNow;
-    tempRequested = true;
-    // do housekeeping
-    controllerCountdown--;
-    if (controllerCountdown <= 0)
+    if (millisNow - lastTempMs >= 1000)
     {
-      // go back to default control
+      lastTempMs = millisNow;
+      sensors.requestTemperatures();
+      tempRequestTime = millis(); 
+      tempRequested = true;
+      return;
+    }
+  }
+  else
+  {
+    if (millis() - tempRequestTime >= tempRequestWaitMs)
+    {
+      tempRequested = false;
+      tempDoTheWorks();
+      return;
+    }
+  }
+  // else housekeeping
+  if (seconds - controllerLastSeen > controllerTimeout)
+  {
+    if (controllerActive)
+    {
+      log(0, "controller timeout - resume defaults");
+      controllerActive = false;
       restoreDefaults();
     }
   }
-  if (tempRequested && millisNow - requestTempMs >= tempRequestWaitMs)
+}
+
+ void tempDoTheWorks()
+ {
+  unsigned long millisNow = millis();
+  // getInputs
+  byte getPcf8 = PCF_01.read8();
+  hwDemand = bitRead(getPcf8, HWDEMANDBIT);
+  chDemand = bitRead(getPcf8, CHDEMANDBIT);
+  flameOn = bitRead(getPcf8, FLAMEONBIT);
+
+  actTemp = sensors.getTempC(dsAddrArr[outTempIx]);
+  if (simMode)
   {
-    tempRequested = false;
+    actTemp = doSim();
+  }
+  
+  if (hwDemand && !chDemand && !tadoChDemand)
+  {
+    setTemp = hwOnlyTemp;
+  }
+  else
+  {
+    setTemp = chSetTemp;
+  }
+  if (prevTempPtr < 0)
+  {
+    for (int ix = 0; ix < PREVTEMPSIZE; ix++)
+    {
+      prevTemps[ix] = actTemp;
+    }
+    prevTempPtr = 0;
+  }
+  double prevTemp = prevTemps[(prevTempPtr + predHist) % PREVTEMPSIZE];
+  double adj = (actTemp - prevTemp) * tempRate / predHist;
+  adjTemp = actTemp + constrain(adj, -3, 3);
+  prevTemps[prevTempPtr % PREVTEMPSIZE] = actTemp;
+  if (prevTempPtr <= 0)
+  {
+    prevTempPtr = PREVTEMPSIZE;
+  }
+  prevTempPtr--;
 
-    // getInputs
-    byte getPcf8 = PCF_01.read8();
-    hwDemand = bitRead(getPcf8, HWDEMANDBIT);
-    chDemand = bitRead(getPcf8, CHDEMANDBIT);
-    flameOn = bitRead(getPcf8, FLAMEONBIT);
+  if (shootHi)
+  {
+    if (actTemp > tmpShoot)
+    {
+      tmpShoot = actTemp;
+    }
+    else if (actTemp < tmpShoot - 1)
+    {
+      shootHi = false;
+      ovrShoot = tmpShoot - setTemp;
+    }
+  }
+  if (shootLo)
+  {
+    if (actTemp < tmpShoot)
+    {
+      tmpShoot = actTemp;
+    }
+    else if (actTemp > tmpShoot + 1)
+    {
+      shootLo = false;
+      undShoot = setTemp - hystTemp - tmpShoot;
+    }
+  }
 
-    if (simMode)
+  if (hwDemand ||chDemand || tadoChDemand)
+  {
+    // is demand
+    switch (tempState)
     {
-      actTemp = doSim();
+      case IDLE:
+      case SHUTDOWN:
+        if (adjTemp >= setTemp - hystTemp/2)
+        {
+          tempState = COOLING;
+          lastOffTime = seconds;
+        }
+        else
+        {
+          tempState = HEATING;
+          lastOnTime = seconds;
+        }
+        break;
     }
-    else
-    {
-      actTemp = sensors.getTempCByIndex(0);
-    }
-   
-    adjTemp = actTemp + ((actTemp - prevTemp) * tempRate);
-    prevTemp = actTemp;
-
-    if (shootHi)
-    {
-      if (actTemp > tmpShoot)
-      {
-        tmpShoot = actTemp;
-      }
-      else if (actTemp < tmpShoot - 1)
-      {
-        shootHi = false;
-        ovrShoot = tmpShoot - setTemp;
-      }
-    }
-    if (shootLo)
-    {
-      if (actTemp < tmpShoot)
-      {
-        tmpShoot = actTemp;
-      }
-      else if (actTemp > tmpShoot + 1)
-      {
-        shootLo = false;
-        undShoot = setTemp - hystTemp - tmpShoot;
-      }
-    }
-
-    if (hwDemand || chDemand)
-    {
-      // is demand
-      switch (tempState)
-      {
-        case IDLE:
-        case SHUTDOWN:
-          if (adjTemp >= setTemp - hystTemp/2)
-          {
-            tempState = COOLING;
-            lastOffTime = seconds;
-          }
-          else
-          {
-            tempState = HEATING;
-            lastOnTime = seconds;
-          }
-          break;
-      }
-    }
-    else
-    {
-      // no demand
-      switch (tempState)
-      {
-        case ANTICYCLE:
-        case HEATING:
-        case COOLING:
-          if (adjTemp > idleTemp)
-          {
-            tempState = SHUTDOWN;
-          }
-          else
-          {
-            tempState = IDLE;
-          }
-          break;
-      }
-    }
-    
+  }
+  else
+  {
+    // no demand
     switch (tempState)
     {
       case ANTICYCLE:
+      case HEATING:
+      case COOLING:
+        if (adjTemp > idleTemp)
+        {
+          tempState = SHUTDOWN;
+        }
+        else
+        {
+          tempState = IDLE;
+        }
+        break;
+    }
+  }
+  
+  switch (tempState)
+  {
+    case ANTICYCLE:
+      {
+        if (seconds - lastOnTime > antiCycleTime)
+        {
+          tempState = HEATING;
+          lastOnTime = seconds;      // for anticycle
+        }
+      }
+      break;
+    case HEATING:
+      {
+        if (adjTemp >= setTemp)
+        { 
+          tempState = COOLING;
+          lastOffTime = seconds;
+          tmpShoot = actTemp;
+          shootHi = true;
+        }
+      }
+      break;
+    case COOLING:
+      {
+        if (adjTemp <= (setTemp - hystTemp))
         {
           if (seconds - lastOnTime > antiCycleTime)
           {
             tempState = HEATING;
-            lastOnTime = seconds;      // for anticycle
-          }
-        }
-        break;
-      case HEATING:
-        {
-          if (adjTemp >= setTemp)
-          { 
-            tempState = COOLING;
-            lastOffTime = seconds;
+            lastOnTime = seconds;
             tmpShoot = actTemp;
-            shootHi = true;
+            shootLo = true;
           }
-        }
-        break;
-      case COOLING:
-        {
-          if (adjTemp <= (setTemp - hystTemp))
+          else
           {
-            if (seconds - lastOnTime > antiCycleTime)
-            {
-              tempState = HEATING;
-              lastOnTime = seconds;
-              tmpShoot = actTemp;
-              shootLo = true;
-            }
-            else
-            {
-              tempState = ANTICYCLE;
-            }
+            tempState = ANTICYCLE;
           }
         }
-        break;
-      case SHUTDOWN:
-        {
-          if (adjTemp <= idleTemp)
-          {
-            tempState = IDLE;
-          }
-        }
-        break;
-      case IDLE:
-        // do nothing
-
-        break;
-
-    }
-    hwValveOn = false;
-    chValveOn = false;
-    boilerStatOff = false;
-    switch (tempState)
-    {
-      case HEATING:
-        break;
-      case COOLING:
-      case ANTICYCLE:
-        boilerStatOff = true;
-        break;
-      case SHUTDOWN:
-        hwValveOn = true;
-        chValveOn = true;
-        boilerStatOff = true;
-        boilerStatOffHold = true;
-        boilerStatOffHoldStart = seconds;
-        break;
-      default:
-        break;
-    }
-    if (boilerStatOffHold)
-    {
-      if (seconds - boilerStatOffHoldStart < valveOffDelay)
+      }
+      break;
+    case SHUTDOWN:
       {
-        boilerStatOff = true;
+        if (adjTemp <= idleTemp)
+        {
+          tempState = IDLE;
+        }
+      }
+      break;
+    case IDLE:
+      // do nothing
+
+      break;
+
+  }
+  hwValveOn = false;
+  chValveOn = false;
+  boilerStatOff = false;
+  if (!chDemand && tadoChDemand)
+  {
+    chValveOn = true;
+  }
+  if (simMode)
+  {
+    flameOn = false;
+  }
+  switch (tempState)
+  {
+    case HEATING:
+      if (simMode)
+      {
+        flameOn = true;
+      }
+      break;
+    case COOLING:
+    case ANTICYCLE:
+      boilerStatOff = true;
+      break;
+    case SHUTDOWN:
+      hwValveOn = true;
+      chValveOn = true;
+      boilerStatOff = true;
+      boilerStatOffHold = true;
+      boilerStatOffHoldStart = seconds;
+      break;
+    default:
+      break;
+  }
+  if (boilerStatOffHold)
+  {
+    if (seconds - boilerStatOffHoldStart < valveOffDelay)
+    {
+      boilerStatOff = true;
+    }
+  }
+  if (flameOn)
+  {
+    flameOnTime++;
+  }
+  else
+  {
+    flameOffTime++;
+  }
+  if (flameOn != lastFlameOn)
+  {
+    lastFlameOn = flameOn;
+    if (flameOnTime + flameOffTime > 0)
+    {
+      dutyCycle = flameOnTime*100 / (flameOnTime + flameOffTime);
+    }
+    if (flameOn)
+    {
+      flameOnTime = 0;
+      if (simMode)
+      {
+        if (random(100) < 50)
+        {
+          simRate+= 0.2;
+        }
+        else
+        {
+          simRate-= 0.2;
+        }
+        simRate = constrain(simRate, 0.1, 0.5);
       }
     }
+    else
+    {
+      flameOffTime = 0;
+    }
+  }
 
-    hwOff = tadoAway;
-    // set relays
-    pcfSet8(HWONBIT, hwValveOn, CHONBIT, chValveOn, HWOFFBIT, hwOff, STATOFFBIT, boilerStatOff);
+  hwOff = tadoAway;
+  // set relays
+  pcfSet8(HWONBIT, hwValveOn, CHONBIT, chValveOn, HWOFFBIT, hwOff, STATOFFBIT, boilerStatOff);
 
-    // report
-    JsonDocument doc;
+  inTemp = sensors.getTempC(dsAddrArr[inTempIx]);
+
+  // report
+  JsonDocument doc;
+  if (tempState != mTempState || update)
+  {
+    mTempState = tempState;
     String s = tempStateS(tempState) + " ";
-    switch (tempState)
-    {
-      case HEATING: s+= String(seconds - lastOnTime); break;
-      case COOLING: s+= String(seconds - lastOffTime); break;
-      case ANTICYCLE: s+= String(antiCycleTime - (seconds - lastOnTime)); break;
-      case SHUTDOWN: s+= String(seconds - lastOffTime); break;
-    }
+    // switch (tempState)
+    // {
+    //   case HEATING: s+= String(seconds - lastOnTime); break;
+    //   case COOLING: s+= String(seconds - lastOffTime); break;
+    //   case ANTICYCLE: s+= String(antiCycleTime - (seconds - lastOnTime)); break;
+    //   case SHUTDOWN: s+= String(seconds - lastOffTime); break;
+    // }
     doc["ts"] = s;
-    doc["hw"] = onOffS(hwDemand);
-    doc["ch"] = onOffS(chDemand);
-    doc["hv"] = onOffS(hwValveOn);
-    doc["cv"] = onOffS(chValveOn);
+  }
+
+  if (mHwDemand != hwDemand || mChDemand != chDemand || mTadoDemand != tadoChDemand || update)
+  {
+    mHwDemand = hwDemand;
+    mChDemand = chDemand;
+    mTadoDemand = tadoChDemand;
+    doc["ds"] = valveS3(hwDemand, chDemand, tadoChDemand);
+  }
+  if ((hwValveOn || hwDemand) != mHwValveOn || (chValveOn || chDemand) != mChValveOn  || update)
+  {
+    mHwValveOn = hwValveOn | hwDemand;
+    mChValveOn = chValveOn | chDemand;
+    doc["vs"] = valveS(hwValveOn | hwDemand, chValveOn | chDemand);
+  }
+  if (mBoilerStatOff != boilerStatOff || update)
+  {
+    mBoilerStatOff = boilerStatOff;
     doc["so"] = onOffS(!boilerStatOff);
+  }
+  if (mFlameOn != flameOn || update)
+  {
+    mFlameOn = flameOn;
     doc["fo"] = onOffS(flameOn);
+  }
+  if (mHwOff != hwOff || update)
+  {
+    mHwOff = hwOff;
     doc["ho"] = onOffS(hwOff);
-    doc["st"] = int(setTemp *10 + 0.5);
-    doc["at"] = int(actTemp *10 + 0.5);
-    doc["jt"] = int(adjTemp *10 + 0.5);
+  }
+  if (mSetTemp != setTemp || update)
+  {
+    mSetTemp = setTemp;
+    doc["st"] = setTemp;
+  }
+  doc["at"] = int(actTemp *10 + 0.5);
+  doc["it"] = int(inTemp *10 + 0.5);
+  doc["jt"] = int(adjTemp *10 + 0.5);
+  if (mUndShoot != undShoot || update)
+  {
+    mUndShoot = undShoot;
     doc["un"] = int(undShoot *10.0 + 0.5);
+  }
+  if (mOvrShoot != ovrShoot || update)
+  {
+    mOvrShoot = ovrShoot;
     doc["ov"] = int(ovrShoot *10.0 + 0.5);
+  }
+    if (mDutyCycle != dutyCycle || update)
+  {
+    mDutyCycle = dutyCycle;
+    doc["dc"] = dutyCycle;
+  }
 
-    doc["seq"] = seq++;
+  doc["seq"] = seq++;
 
-    String topic = mqttMoniker + "/d";
-    mqttSend(topic, doc);
+  String topic = mqttMoniker + "/d";
+  mqttSend(topic, doc);
+  update = false;
 
-    if (graphMode)
-    {
-      loga(1,String(setTemp));
-      loga(1," ");
-      loga(1,String(setTemp - hystTemp));
-      loga(1," ");
-      loga(1,String(actTemp));
-      loga(1," ");
-      log(1,String(adjTemp));
-    }
+  if (graphMode)
+  {
+    loga(1,String(setTemp));
+    loga(1," ");
+    loga(1,String(setTemp - hystTemp));
+    loga(1," ");
+    loga(1,String(actTemp));
+    loga(1," ");
+    log(1,String(adjTemp));
   }
 }
 
+
+
+String valveS(bool hw, bool ch)
+{
+  if (hw && ch)
+  {
+    return "hw + ch";
+  }
+  if (hw)
+  {
+    return "hw";
+  }
+  if (ch)
+  {
+    return "ch";
+  }
+  return "";
+}
+
+String valveS3(bool hw, bool ch, bool tado)
+{
+  String s;
+  if (hw)
+  {
+    s+= "hw ";
+  }
+  if (ch)
+  {
+   s+= "ch ";
+  }
+  else if (tado)
+  {
+   s+= "tado ";
+  }
+  return s;
+}
+
 // ---- end custom code --------------
+
+// flash gordon. visual of longest loop time in last second
+#define LEDPIN 2
+int longestElapsed;
+unsigned long ledOnTime;
+bool ledOn;
 
 void setup()
 {
   loga(1, module);
   loga(1, " ");
   log(1, buildDate);
+  pinMode(LEDPIN, OUTPUT);
   Serial.begin(115200);
   checkRestartReason();
   mountSpiffs();
@@ -1569,6 +1886,8 @@ void setup()
 
 void loop()
 {
+  unsigned long startTime = millis();
+
   esp_task_wdt_reset();
   telnet.loop();
   mqttClient.loop();
@@ -1577,4 +1896,28 @@ void loop()
   tempLoop();
 
   delay(1);
+
+  unsigned long elapsedTime = millis() - startTime;
+  if (elapsedTime > longestElapsed)
+  {
+    longestElapsed = elapsedTime;
+  }
+  if (ledOn)
+  {
+    if (millis() - ledOnTime > longestElapsed + ledExtend)
+    {
+      digitalWrite(LEDPIN, LOW);
+      ledOn = false;
+      longestElapsed = 0;
+    }
+  }
+  else
+  {
+    if (millis() - ledOnTime > ledInterval)
+    {
+      ledOnTime = millis();
+      digitalWrite(LEDPIN, HIGH);
+      ledOn = true;
+    }
+  }
 }
